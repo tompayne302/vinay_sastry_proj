@@ -1,0 +1,17 @@
+# Patient-level data: never commit
+*.csv
+*.xlsx
+*.rds
+!los_app/model.rds
+
+# Quarto / R artefacts
+/.quarto/
+*_cache/
+*_files/
+index.html
+.Rproj.user/
+.Rhistory
+.RData
+.posit/
+.DS_Store
+rsconnect/
