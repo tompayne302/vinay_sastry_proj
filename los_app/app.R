@@ -47,13 +47,8 @@ ui <- page_sidebar(
     unname(lapply(spec, make_input))
   )),
   uiOutput("warning_banner"),
-  layout_columns(
-    col_widths = c(6, 6),
-    value_box(title = "Predicted mean length of stay",
-              value = textOutput("pred_mean"), theme = "primary"),
-    value_box(title = "Typical range for an individual patient (5th to 95th percentile)",
-              value = textOutput("pred_range"), theme = "secondary")
-  ),
+  value_box(title = "Predicted mean length of stay",
+            value = textOutput("pred_mean"), theme = "primary"),
   card(
     card_header("Input check"),
     tableOutput("check_table")
@@ -62,10 +57,8 @@ ui <- page_sidebar(
     card_header("About this tool"),
     p(sprintf(paste0(
       "Negative binomial regression with LASSO penalisation, developed in %d patients. ",
-      "Predicted mean LOS = exp(intercept + sum of coefficient x value). ",
-      "The range shown is the 5th to 95th percentile of the negative binomial distribution ",
-      "(dispersion theta = %.2f) around the predicted mean; it does not include uncertainty ",
-      "in the model coefficients."), model$n_dev, model$theta)),
+      "Predicted mean LOS = exp(intercept + sum of coefficient x value)."),
+      model$n_dev)),
     p("Inputs outside the range of the development data are extrapolations and predictions ",
       "for such patients should not be relied upon. This tool is intended to support, not ",
       "replace, clinical judgement.")
@@ -131,12 +124,6 @@ server <- function(input, output, session) {
   output$pred_mean <- renderText({
     if (!complete()) return("Enter all inputs")
     sprintf("%.1f days", mu())
-  })
-
-  output$pred_range <- renderText({
-    if (!complete()) return("-")
-    q <- qnbinom(c(0.05, 0.95), mu = mu(), size = model$theta)
-    sprintf("%d to %d days", q[1], q[2])
   })
 
   output$warning_banner <- renderUI({
