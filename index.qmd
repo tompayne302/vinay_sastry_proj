@@ -247,7 +247,7 @@ A variance well above the mean indicates overdispersion, supporting a negative b
 
 ## Step 2: Multiple imputation
 
-Missing values (`eccs_pre` and `pm_diag_cat_pre`) are imputed with `mice`. `eccs_pre` is imputed using predictive mean matching (PMM). `pm_diag_cat_pre` is an unordered categorical variable, and `mice`'s PMM works only with numeric variables (applying it to arbitrary factor codes would be meaningless), so it is imputed with the `mice` method for nominal factors, polytomous logistic regression (`polyreg`). The imputation model includes all predictors and the outcome (log-transformed, since LOS is skewed); omitting the outcome from the imputation model would bias associations towards the null.
+Missing values (`eccs_pre` and `pm_diag_cat_pre`) are imputed with `mice`. `eccs_pre` is imputed using predictive mean matching (PMM). `pm_diag_cat_pre` is an unordered categorical variable, and `mice`'s PMM works only with numeric variables, so it is imputed with the `mice` method for nominal factors, polytomous logistic regression (`polyreg`). The imputation model includes all predictors and the outcome (log-transformed, since LOS is skewed).
 
 Because the imputation is part of the model-building process, it is repeated in every bootstrap sample. To combine imputations with a single LASSO fit, we use the **stacked imputed datasets** approach: the $m$ completed datasets are stacked, each row is given weight $1/m$, and cross-validation folds keep all copies of the same patient together. Predictions for a patient are averaged across the $m$ imputed datasets.
 
@@ -421,6 +421,8 @@ For each of $B$ bootstrap samples we:
 3. Compute performance in the imputed bootstrap sample (apparent) and in the original data (test, using the imputed versions of the original data from Step 2).
 4. Optimism = apparent minus test performance.
 
+In the same loop we also refit the model **using only the terms retained in the final model, at the final model's lambda**, and store the coefficients (`boot_coefs`). These are used in Step 8 to give a bootstrap confidence interval for the predicted mean LOS in the calculator. The interval is *conditional* on the selected predictors and penalty (it reflects sampling and imputation variability but not uncertainty about which variables are selected), which is what allows the calculator to ask only for the retained predictors.
+
 The mean optimism is subtracted from the apparent performance of the final model (Harrell's method). This step is computationally intensive (imputation plus cross-validation in every sample).
 
 ```{r bootstrap}
@@ -428,7 +430,23 @@ B <- 500
 m_boot <- 5
 set.seed(7352)
 
-boot_res <- map(seq_len(B), \(b) {
+# Final-model terms and penalty, used for the conditional CI for the calculator
+cf_final <- coef(final_fit$cv, s = "lambda.min")
+sel_cols <- setdiff(rownames(cf_final)[as.numeric(cf_final) != 0], "(Intercept)")
+lambda_final <- final_fit$cv$lambda.min
+
+# Refit at the final lambda using only the final-model terms
+fit_fixed <- function(imps, theta) {
+  m <- length(imps)
+  x <- do.call(rbind, map(imps, make_x))[, sel_cols, drop = FALSE]
+  y <- unlist(map(imps, "los_bal"))
+  fit <- glmnet(x, y, weights = rep(1 / m, length(y)),
+                family = MASS::negative.binomial(theta), alpha = 1,
+                lambda = lambda_final)
+  c("(Intercept)" = as.numeric(fit$a0), setNames(as.numeric(fit$beta), sel_cols))
+}
+
+boot_out <- map(seq_len(B), \(b) {
   idx <- sample(n_obs, replace = TRUE)
   d_boot <- dat[idx, ]
   tryCatch({
@@ -436,12 +454,19 @@ boot_res <- map(seq_len(B), \(b) {
     fit_b  <- fit_nb_lasso(imps_b)
     app    <- perf(fit_b, imps_b)
     test   <- perf(fit_b, imps_full)
-    tibble(b = b, metric = names(app), apparent = app, test = test,
-           n_nonzero = sum(coef(fit_b$cv, s = "lambda.min")[-1] != 0))
+    list(res = tibble(b = b, metric = names(app), apparent = app, test = test,
+                      n_nonzero = sum(coef(fit_b$cv, s = "lambda.min")[-1] != 0)),
+         coefs = fit_fixed(imps_b, fit_b$theta))
   }, error = function(e) NULL)
 }) |>
+  compact()
+
+boot_res <- map(boot_out, "res") |>
   list_rbind() |>
   mutate(optimism = apparent - test)
+
+# One row per bootstrap sample: coefficients of the final-model terms
+boot_coefs <- do.call(rbind, map(boot_out, "coefs"))
 
 n_boot_ok <- n_distinct(boot_res$b)
 n_boot_ok
@@ -503,7 +528,7 @@ The final model is a log-linear model, so the predicted mean LOS for a new patie
 
 $$\hat\mu = \exp\left(\beta_0 + \sum_j \beta_j x_j\right)$$
 
-using the coefficients on the original (unstandardised) scale from the final LASSO fit. The calculator only needs the intercept, the non-zero coefficients, theta, and the observed range of each predictor in the development data (used to flag out-of-bounds inputs). These are saved to `los_app/model.rds`, which is deployed with the app in `los_app/app.R`.
+using the coefficients on the original (unstandardised) scale from the final LASSO fit. The calculator needs the intercept, the non-zero coefficients, theta, and the observed range of each predictor in the development data (used to flag out-of-bounds inputs). The bootstrap coefficient sets (`boot_coefs`, from Step 6) are also saved, so the calculator can show a 90% bootstrap percentile confidence interval for the predicted mean: the predicted mean is computed under each bootstrap model, and the 5th and 95th percentiles are reported. Everything is saved to `los_app/model.rds`, which is deployed with the app in `los_app/app.R`.
 
 ```{r export-model}
 cf <- coef(final_fit$cv, s = "lambda.min")
@@ -543,6 +568,7 @@ model_export <- list(
   coefs = beta_nz,
   theta = final_fit$theta,
   var_spec = var_spec,
+  boot_coefs = boot_coefs,
   n_dev = n_obs,
   perf = perf_table |> dplyr::select(Measure, Apparent, `Optimism-corrected`)
 )
