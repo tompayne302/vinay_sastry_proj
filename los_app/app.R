@@ -36,11 +36,69 @@ badge <- function(text, colour) {
   span(class = paste0("badge bg-", colour), text)
 }
 
+# ---- Prediction plot -------------------------------------------------------
+
+plot_prediction <- function(m, ci, theta) {
+  q <- qnbinom(c(0.05, 0.95), mu = m, size = theta)
+  x_max <- max(qnbinom(0.99, mu = m, size = theta), ci[2]) + 3
+  d <- data.frame(los = 0:x_max, p = dnbinom(0:x_max, mu = m, size = theta))
+  d$band <- factor(ifelse(d$los >= q[1] & d$los <= q[2],
+                          sprintf("Inside 90%% prediction interval (%d\u2013%d days)", q[1], q[2]),
+                          "Outside 90% prediction interval"))
+  p_max <- max(d$p)
+  y_ci <- p_max * 1.15
+
+  ggplot(d, aes(los, p)) +
+    geom_col(aes(fill = band), width = 0.9) +
+    geom_vline(xintercept = m, linetype = "dashed", linewidth = 0.6) +
+    # CI for the mean, drawn as a bar with end ticks above the distribution
+    annotate("segment", x = ci[1], xend = ci[2], y = y_ci, yend = y_ci, linewidth = 1) +
+    annotate("segment", x = ci, xend = ci, y = y_ci - p_max * 0.03,
+             yend = y_ci + p_max * 0.03, linewidth = 1) +
+    annotate("point", x = m, y = y_ci, size = 3.5) +
+    annotate("label", x = m, y = y_ci + p_max * 0.06, vjust = 0, size = 4.5,
+             fill = "white",
+             label = sprintf("Mean %.1f days (90%% CI %.1f\u2013%.1f)", m, ci[1], ci[2])) +
+    scale_fill_manual(values = c("#2c7fb8", "grey80"), name = NULL,
+                      breaks = levels(d$band)[c(grep("^Inside", levels(d$band)),
+                                                grep("^Outside", levels(d$band)))]) +
+    scale_x_continuous(breaks = scales::breaks_pretty(n = 8),
+                       expand = expansion(mult = c(0.01, 0.02))) +
+    scale_y_continuous(labels = scales::label_percent(accuracy = 0.1),
+                       expand = expansion(mult = c(0, 0.05))) +
+    coord_cartesian(ylim = c(0, p_max * 1.35), clip = "off") +
+    labs(x = "Length of stay (days)", y = "Probability") +
+    theme_minimal(base_size = 14) +
+    theme(legend.position = "bottom",
+          legend.text = element_text(size = 12),
+          panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_blank(),
+          axis.title = element_text(face = "bold"))
+}
+
 # ---- UI --------------------------------------------------------------------
+
+app_theme <- bs_theme(version = 5) |>
+  bs_add_rules("
+    .value-box-value { font-size: 1.9rem !important; line-height: 1.2; white-space: nowrap; }
+    .value-box-title { font-size: 1rem !important; font-weight: 600; }
+  ")
+
+result_box <- function(title, output_id, caption, theme) {
+  value_box(
+    title = title,
+    value = textOutput(output_id, inline = TRUE),
+    p(caption, class = "small mb-0"),
+    theme = theme,
+    min_height = "160px"
+  )
+}
 
 ui <- page_sidebar(
   title = "Rehabilitation length of stay calculator",
-  theme = bs_theme(version = 5),
+  theme = app_theme,
+  # Not fillable: lets cards keep their natural height and the page scroll
+  fillable = FALSE,
   sidebar = do.call(sidebar, c(
     list(width = 420,
          h5("Patient characteristics"),
@@ -49,17 +107,22 @@ ui <- page_sidebar(
   )),
   uiOutput("warning_banner"),
   layout_columns(
-    col_widths = c(4, 4, 4),
-    value_box(title = "Predicted mean length of stay",
-              value = textOutput("pred_mean"), theme = "primary"),
-    value_box(title = "90% confidence interval for the mean",
-              value = textOutput("ci_mean"), theme = "info"),
-    value_box(title = "90% prediction interval for an individual patient",
-              value = textOutput("pred_range"), theme = "secondary")
+    col_widths = breakpoints(sm = 12, lg = 4),
+    result_box("Predicted mean LOS", "pred_mean",
+               "Expected average stay for patients like this", "primary"),
+    result_box("90% CI for the mean", "ci_mean",
+               "Uncertainty in the average (bootstrap)", "info"),
+    result_box("90% prediction interval", "pred_range",
+               "Likely range for an individual patient", "secondary")
   ),
   card(
+    full_screen = TRUE,
     card_header("Likely length of stay for this patient"),
-    plotOutput("pred_plot", height = "320px")
+    plotOutput("pred_plot", height = "480px"),
+    card_footer(class = "small text-muted",
+      "Bars: model-predicted probability of each length of stay. Blue bars fall inside the ",
+      "90% prediction interval. The black point and line at the top show the predicted mean ",
+      "and its 90% bootstrap confidence interval.")
   ),
   card(
     card_header("Input check"),
@@ -161,44 +224,19 @@ server <- function(input, output, session) {
   output$ci_mean <- renderText({
     if (!complete()) return("-")
     ci <- quantile(boot_mu(), c(0.05, 0.95), names = FALSE)
-    sprintf("%.1f to %.1f days", ci[1], ci[2])
+    sprintf("%.1f\u2013%.1f days", ci[1], ci[2])
   })
 
   output$pred_range <- renderText({
     if (!complete()) return("-")
     q <- qnbinom(c(0.05, 0.95), mu = mu(), size = model$theta)
-    sprintf("%d to %d days", q[1], q[2])
+    sprintf("%d\u2013%d days", q[1], q[2])
   })
 
   output$pred_plot <- renderPlot({
     req(complete())
-    m <- mu()
-    q <- qnbinom(c(0.05, 0.95), mu = m, size = model$theta)
-    x <- 0:max(qnbinom(0.995, mu = m, size = model$theta), q[2] + 5)
-    d <- data.frame(los = x, p = dnbinom(x, mu = m, size = model$theta))
-    d$inside <- d$los >= q[1] & d$los <= q[2]
-    ci <- quantile(boot_mu(), c(0.05, 0.95), names = FALSE)
-    y_ci <- -0.06 * max(d$p)
-
-    ggplot(d, aes(los, p, fill = inside)) +
-      geom_col(width = 1) +
-      geom_vline(xintercept = m, linewidth = 1) +
-      annotate("label", x = m, y = max(d$p), hjust = -0.1, vjust = 1,
-               label = sprintf("Mean: %.1f days", m)) +
-      annotate("segment", x = ci[1], xend = ci[2], y = y_ci, yend = y_ci,
-               linewidth = 2, colour = "black") +
-      annotate("point", x = m, y = y_ci, size = 4, colour = "black") +
-      annotate("text", x = ci[2], y = y_ci, hjust = -0.1, size = 4.5,
-               label = "90% CI for the mean") +
-      scale_fill_manual(values = c("TRUE" = "#2c7fb8", "FALSE" = "grey80"),
-                        labels = c("TRUE" = "Within 90% interval", "FALSE" = "Outside interval"),
-                        name = NULL) +
-      scale_y_continuous(breaks = function(l) pretty(c(0, l[2])),
-                         labels = scales::percent_format(accuracy = 0.1)) +
-      labs(x = "Length of stay (days)", y = "Probability of each exact LOS") +
-      theme_minimal(base_size = 14) +
-      theme(legend.position = "top", panel.grid.minor = element_blank())
-  })
+    plot_prediction(mu(), quantile(boot_mu(), c(0.05, 0.95), names = FALSE), model$theta)
+  }, res = 110)
 
   output$warning_banner <- renderUI({
     st <- status()
